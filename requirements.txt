@@ -1,4 +1,4 @@
 keyboard
 pillow
 pytesseract
-openai
+requests

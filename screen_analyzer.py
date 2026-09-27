@@ -7,13 +7,15 @@
   1. Программа ждёт нажатие горячей клавиши Alt+X.
   2. Делает снимок всего экрана.
   3. Распознаёт текст на снимке (OCR через Tesseract).
-  4. Отправляет распознанный текст в LLM (OpenAI или любой совместимый API)
-     вместе с системным промптом, который просит определить,
+  4. Отправляет распознанный текст в LLM через агрегатор Polza AI
+     (https://api.polza.ai — OpenAI-совместимый API, дающий доступ
+     к моделям GPT, Claude, Gemini, DeepSeek и др.) либо в любой другой
+     OpenAI-совместимый эндпоинт. Системный промпт просит определить,
      что это за страница и какой город на ней указан.
   5. Показывает ответ во всплывающем окне (Tkinter) и дублирует в консоль.
 
 Требования:
-  pip install keyboard pillow pytesseract openai
+  pip install keyboard pillow pytesseract requests
   + системная зависимость Tesseract OCR:
       Ubuntu/Debian : sudo apt install tesseract-ocr tesseract-ocr-rus
       macOS         : brew install tesseract tesseract-lang
@@ -25,8 +27,9 @@
   (в Linux для работы модуля keyboard могут потребоваться права root:
    sudo python3 screen_analyzer.py)
 
-Настройки API-ключа берутся из переменных окружения OPENAI_API_KEY / OPENAI_BASE_URL
-или из файла .env рядом со скриптом.
+Настройки API-ключа берутся из переменных окружения POLZA_API_KEY / API_BASE_URL
+или из файла .env рядом со скриптом. По умолчанию используется агрегатор Polza AI
+(https://api.polza.ai/v1).
 """
 
 import os
@@ -58,7 +61,11 @@ OCR_LANGS = "rus+eng"
 TESSERACT_CMD_WINDOWS = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 HOTKEY = "alt+x"          # комбинация клавиш для запуска анализа
-MODEL_NAME = "gpt-4o-mini"  # модель OpenAI (или совместимого API)
+
+# Агрегатор Polza AI — OpenAI-совместимый API (один ключ -> много моделей:
+# GPT, Claude, Gemini, DeepSeek и др.). Ключ берётся из POLZA_API_KEY.
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.polza.ai/v1")
+MODEL_NAME = "gpt-4o-mini"  # модель можно поменять на любую доступную в Polza AI
 
 # ---------------------------------------------------------------------------
 # Импорт зависимостей с понятными ошибками
@@ -85,9 +92,9 @@ except ImportError:
     _missing("pytesseract")
 
 try:
-    from openai import OpenAI
+    import requests
 except ImportError:
-    _missing("openai")
+    _missing("requests")
 
 
 # ---------------------------------------------------------------------------
@@ -130,30 +137,46 @@ def ocr_image(image) -> str:
 
 
 def ask_llm(recognized_text: str) -> str:
-    """Отправляет распознанный текст в LLM с системным промптом."""
-    api_key = os.environ.get("OPENAI_API_KEY")
+    """Отправляет распознанный текст в LLM через агрегатор Polza AI
+    (OpenAI-совместимый endpoint /chat/completions)."""
+    api_key = os.environ.get("POLZA_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        return ("Не задан API-ключ. Положите его в файл .env "
-                "(OPENAI_API_KEY=sk-...) или экспортируйте переменную "
-                "окружения OPENAI_API_KEY.")
+        return ("Не задан API-ключ Polza AI. Положите его в файл .env "
+                "(POLZA_API_KEY=...) или экспортируйте переменную окружения "
+                "POLZA_API_KEY.")
 
-    kwargs = {"api_key": api_key}
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    if base_url:  # для локальных/сторонних эндпоинтов (Ollama, OpenRouter и т.п.)
-        kwargs["base_url"] = base_url
-
-    client = OpenAI(**kwargs)
-
-    print("[...]: отправляю текст в модель...")
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
+    url = API_BASE_URL.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "Текст со скриншота:\n" + recognized_text},
         ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content.strip()
+        "temperature": 0.2,
+    }
+
+    print(f"[...]: отправляю текст в модель '{MODEL_NAME}' через {url} ...")
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    except requests.RequestException as e:
+        return f"Сетевая ошибка при запросе к Polza AI: {e}"
+
+    if resp.status_code != 200:
+        return (f"Polza AI вернул ошибку {resp.status_code}: "
+                f"{resp.text[:500]}\n"
+                "Проверьте ключ POLZA_API_KEY и название модели MODEL_NAME "
+                "(список доступных моделей — в личном кабинете Polza AI).")
+
+    try:
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError):
+        return f"Не удалось разобрать ответ Polza AI: {resp.text[:500]}"
+    return answer.strip()
 
 
 def show_result_window(answer: str, raw_text: str):
@@ -232,10 +255,11 @@ def main():
     load_env_file()
 
     print("=" * 60)
-    print(" Анализатор экрана запущен.")
+    print(" Анализатор экрана запущен (агрегатор Polza AI).")
     print(f" Нажмите {HOTKEY.upper()} — будет сделан снимок экрана,")
-    print(" распознан текст и отправлен в модель с вопросом:")
+    print(" распознан текст и отправлен в модель через Polza AI с вопросом:")
     print('   "Какая это страница и какой город?"')
+    print(f" Эндпоинт: {API_BASE_URL} | Модель: {MODEL_NAME}")
     print(" Ctrl+C — выход.")
     print("=" * 60)
 
